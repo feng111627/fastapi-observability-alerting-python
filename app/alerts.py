@@ -32,7 +32,11 @@ _FIRING = "firing"
 
 @dataclass
 class AlertState:
-    """一条进行中/已收敛的告警状态。"""
+    """一条进行中/已收敛的告警状态。
+
+    ``source`` 为 None 表示全局口径告警（兼容旧行为），否则表示
+    该告警周期只属于对应来源；不同来源的告警互不合并、互不收敛。
+    """
 
     fingerprint: str
     rule: str
@@ -43,6 +47,7 @@ class AlertState:
     last_seen: float
     window_seconds: float
     resolved_at: float | None = None
+    source: str | None = None
 
 
 class AlertEngine:
@@ -54,10 +59,12 @@ class AlertEngine:
         self._history: dict[str, list[AlertState]] = {}
 
     @staticmethod
-    def fingerprint(rule_name: str) -> str:
-        # 当前一个规则即一条异常流；保留 fingerprint 抽象，
-        # 便于将来在 key 中加入维度（如来源、环境）而不改调用方。
-        return f"rule:{rule_name}"
+    def fingerprint(rule_name: str, source: str | None = None) -> str:
+        # 全局口径保持旧格式 rule:<name>，行为与历史版本一致；
+        # 带来源时追加来源维度，同一条规则在不同来源上各有独立告警周期。
+        if source is None:
+            return f"rule:{rule_name}"
+        return f"rule:{rule_name}|source:{source}"
 
     def evaluate(
         self,
@@ -65,6 +72,7 @@ class AlertEngine:
         value: float,
         firing: bool,
         now: float,
+        source: str | None = None,
     ) -> str:
         """评估单条规则的一次观测。
 
@@ -74,7 +82,7 @@ class AlertEngine:
         - ``upgraded``：持续命中达到升级次数，已升为 critical；
         - ``none``：未越阈，不产生变化（收敛由 :meth:`sweep` 负责）。
         """
-        fp = self.fingerprint(rule.name)
+        fp = self.fingerprint(rule.name, source)
         with self._lock:
             if not firing:
                 # 单次未越阈不立即收敛：异常是否结束以时间窗口为准，
@@ -92,6 +100,7 @@ class AlertEngine:
                     first_seen=now,
                     last_seen=now,
                     window_seconds=rule.window_seconds,
+                    source=source,
                 )
                 self._active[fp] = state
                 return _TRIGGERED

@@ -30,5 +30,23 @@
     "window_seconds": 300,
     "severity": "warning",
     "upgrade_after": 0
+  },
+  {
+    "name": "error_rate_per_source_1m",
+    "metric": "error_rate",
+    "threshold": 0.2,
+    "window_seconds": 60,
+    "severity": "warning",
+    "upgrade_after": 2,
+    "source": "*"
+  },
+  {
+    "name": "latency_p95_web_1m",
+    "metric": "latency_p95",
+    "threshold": 500,
+    "window_seconds": 60,
+    "severity": "critical",
+    "upgrade_after": 0,
+    "source": "web"
   }
 ]

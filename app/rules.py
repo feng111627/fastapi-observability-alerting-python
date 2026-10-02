@@ -11,13 +11,24 @@
 import threading
 from dataclasses import dataclass, field
 
+from app.metrics import MAX_SOURCE_LEN
+
 VALID_METRICS = frozenset({"error_rate", "latency_p95", "latency_avg", "error_count"})
 VALID_SEVERITIES = frozenset({"warning", "critical"})
+
+#: source 字段的特殊取值：对每个来源分别评估。
+SOURCE_ALL = "*"
 
 
 @dataclass(frozen=True)
 class AlertRule:
-    """一条经过校验的不可变告警规则。"""
+    """一条经过校验的不可变告警规则。
+
+    ``source`` 语义：
+    - None：全局口径（默认，兼容旧规则），对所有来源的汇总数据评估；
+    - "*"：按来源分别评估，每个来源一条独立的告警周期；
+    - 其它字符串：只对指定来源的数据评估。
+    """
 
     name: str
     metric: str
@@ -25,6 +36,7 @@ class AlertRule:
     window_seconds: float
     severity: str = "warning"
     upgrade_after: int = 0
+    source: str | None = None
 
 
 class RuleValidationError(ValueError):
@@ -120,6 +132,22 @@ def validate_rule(raw: dict) -> AlertRule:
             f"规则[{name}] upgrade_after: 不能为负数，收到 {upgrade_after}"
         )
 
+    source = raw.get("source", None)
+    if source is not None:
+        if not isinstance(source, str):
+            raise RuleValidationError(
+                f"规则[{name}] source: 必须是字符串，收到 {source!r}"
+            )
+        source = source.strip()
+        if not source:
+            raise RuleValidationError(
+                f"规则[{name}] source: 不能为空字符串；省略该字段表示全局口径"
+            )
+        if source != SOURCE_ALL and len(source) > MAX_SOURCE_LEN:
+            raise RuleValidationError(
+                f"规则[{name}] source: 长度不能超过 {MAX_SOURCE_LEN}，收到 {len(source)}"
+            )
+
     return AlertRule(
         name=name,
         metric=metric,
@@ -127,6 +155,7 @@ def validate_rule(raw: dict) -> AlertRule:
         window_seconds=window,
         severity=severity,
         upgrade_after=upgrade_after,
+        source=source,
     )
 
 

@@ -9,7 +9,7 @@
 | 模块 | 职责 |
 | --- | --- |
 | `app/tracing.py` | `request_id` / `trace_id` 生成、基于 `contextvars` 的上下文绑定与恢复 |
-| `app/metrics.py` | 请求级指标注册表：按 `request_id` 幂等去重、采样口径、一致快照 |
+| `app/metrics.py` | 请求级指标注册表：按 `request_id` 幂等去重、采样口径、一致快照、来源维度与来源基数上限 |
 | `app/rules.py` | 告警规则校验、逐条隔离、不可变快照 + 原子热更新、整批失败降级 |
 | `app/alerts.py` | 时间窗口告警引擎：合并去重、持续升级、到期收敛 |
 | `app/evaluation.py` | 窗口指标聚合（错误率/错误数/平均/P95）与逐规则评估编排 |
@@ -25,7 +25,24 @@
   请求结束时通过 token 恢复上下文。
 - 响应头会回传 `X-Request-Id` / `X-Trace-Id`，便于排障关联日志、指标与告警。
 
-## 3. 指标口径（重点）
+## 3. 来源维度（source）
+
+每条上报可以带一个 `source` 字段，标识这条请求属于哪个来源
+（调用方、业务线等），用于把混在一起的总量拆成各来源各自的口径。
+
+- **默认来源**：未带 `source`、或 `source` 为空白字符串的上报，
+  一律落入默认来源 `default`，行为与引入来源维度之前完全一致，
+  旧上报不需要任何改造。
+- **归一化**：来源名去首尾空白；超过 64 字符的上报会被接口参数校验拒绝（422），
+  注册表内部也会截断到 64 字符兜底，单个键的内存有界。
+- **归属唯一**：每条请求记录恰好归属一个来源，因此
+  **全局快照 == 各来源快照之和**（total / sampled / error_count /
+  sum_duration_ms / by_status 逐项对得上），同一笔请求不会被算两遍也不会漏掉。
+- **互不影响**：幂等去重（request_id）、采样开关、并发上报的语义在
+  来源维度下保持不变；同一 request_id 以第一次上报的来源为准，
+  重复上报不会消耗来源基数配额。
+
+## 4. 指标口径（重点）
 
 指标按 `request_id` **幂等**记录：同一 `request_id` 的重复上报直接忽略
 （first-write-wins），因此重复上报、采样开关切换都不会导致重复计数或指标漂移。
@@ -47,19 +64,42 @@
    “total 已加、分桶还没加”的撕裂视图。
 3. **记录不可变**：`RequestRecord` 与 `MetricSnapshot` 均为冻结对象，
    发布后外部无法篡改。
+4. **来源口径**：上表所有口径都同时提供全局与按来源两个视图
+   （`GET /metrics` 与 `GET /metrics?source=<名>` /
+   `GET /metrics/sources`），同一套记录聚合，不存在两套账本。
 
-## 4. 告警语义
+## 5. 来源基数上限与溢出策略
 
-### 4.1 支持的指标
+来源名是外部传入的，不能无限制增长。注册表对不同来源数量设有上限
+`max_sources`（默认 128，应用工厂 `create_app(max_sources=...)` 可配）：
+
+- 前 `max_sources` 个不同来源各自独立统计；
+- 超出上限后，**新出现的来源统一归并到溢出桶 `__overflow__`**，
+  桶内记录照常进入全局口径与该桶口径，**不丢弃请求、不改坏已统计数字**；
+- 归并可观察：`GET /metrics/sources` 返回的 `cardinality` 中包含
+  `max_sources`（上限）、`active_sources`（当前来源数）、
+  `overflowed`（是否发生归并）、`overflow_records`（被归并的记录数）、
+  `overflow_sources_sample`（被归并的原始来源名样本，最多保留 64 个，
+  防止乱造来源撑爆内存）；
+- 被归并的原始来源名不能再单独查询（按名查询返回空快照），
+  其数据只在 `__overflow__` 桶与全局口径中可见；
+- 重复上报（request_id 去重）优先于归并计数，不会虚增 `overflow_records`。
+
+## 6. 告警语义
+
+### 6.1 支持的指标
 
 `error_rate`、`error_count`、`latency_avg`、`latency_p95`
 （P95 使用最近秩 nearest-rank 口径：`ceil(0.95 * n)`）。
 
-### 4.2 生命周期
+### 6.2 生命周期
 
-以**规则名**为 `fingerprint`（形如 `rule:<name>`），一条规则同一时间只保留
-一条进行中的有效告警。评估按“轮”进行：每调用一次 `POST /alerts/evaluate`，
-每条当前规则产生一次观测（后台收敛循环每 0.2s 执行一次 sweep，但不产生观测）。
+以**规则名 + 来源**为 `fingerprint`：全局口径规则为 `rule:<name>`（与历史
+版本一致），带来源的规则为 `rule:<name>|source:<来源>`。同一条规则在同一个
+来源上同一时间只保留一条进行中的有效告警；不同来源的告警周期完全独立。
+评估按“轮”进行：每调用一次 `POST /alerts/evaluate`，每条当前规则产生一次
+观测（`source="*"` 的规则对每个已知来源各产生一次观测；后台收敛循环
+每 0.2s 执行一次 sweep，但不产生观测）。
 
 1. `triggered`：某轮观测中窗口指标首次 `>= threshold`，产生一条 `firing` 告警，
    初始级别为规则配置的 `severity`（默认 `warning`），`count=1`。
@@ -76,7 +116,26 @@
 设计取舍：单次“未越阈”样本不会立即关闭告警，异常是否结束**只以时间窗口
 为准**，避免一次抖动样本导致告警反复开合（flapping）。
 
-### 4.3 并发保证
+### 6.3 按来源判定（source 字段）
+
+规则的 `source` 字段控制评估口径：
+
+| 取值 | 语义 |
+| --- | --- |
+| 缺省 / 不填 | 全局口径：对所有来源的汇总数据评估，行为与历史版本完全一致 |
+| `"*"` | 按来源分别判定：每个已知来源独立评估，同一条规则在每个来源上各有独立的触发/合并/升级/收敛周期 |
+| 具体来源名 | 只统计该来源的样本，其它来源的错误不会稀释也不会抬高判定 |
+
+按来源判定的隔离保证：
+
+- 一个来源持续触发只在自己的告警上合并计数、达到条件只自己升级，
+  其它来源不会跟着计数或被合并；
+- 某个来源窗口到期只收敛自己的告警，不会把别的来源一起收掉；
+- 上报、规则热更新、告警评估并发混跑时，各来源的判定在同一把锁内
+  串行完成，结论不重复、不遗漏；
+- 不带来源的旧规则集可以原样加载，`source` 缺省即全局口径，无需迁移。
+
+### 6.4 并发保证
 
 `AlertEngine.evaluate` 的判定在同一把锁内串行完成：
 
@@ -85,7 +144,7 @@
 - 升级临界区同样串行，`upgraded` 恰好出现一次；
 - 规则即使被热更新删除，在飞告警也会按创建时的 `window_seconds` 按时收敛。
 
-### 4.4 规则热更新与降级
+### 6.5 规则热更新与降级
 
 - 规则**整批替换**，逐条校验：坏规则单独跳过，错误信息形如
   `规则[<name>] <字段>: <原因>`，每条原因可区分，**不影响同批其它规则**；
@@ -104,21 +163,23 @@
 | `window_seconds` | 正数 |
 | `severity` | `warning` / `critical` |
 | `upgrade_after` | 非负整数，持续命中多少次后升级（0 不升级） |
+| `source` | 可缺省；`"*"` 按来源分别判定；具体来源名只判定该来源；最长 64 字符 |
 
 示例见 `config/rules.example.json`。
 
-## 5. HTTP 接口
+## 7. HTTP 接口
 
 | 方法 路径 | 说明 |
 | --- | --- |
-| `POST /metrics/report` | 幂等上报一次请求指标；返回 `accepted/duplicate` 标识是否首次记录 |
-| `GET  /metrics` | 当前指标一致快照 |
+| `POST /metrics/report` | 幂等上报一次请求指标（可带 `source`）；返回 `accepted/duplicate` 标识是否首次记录 |
+| `GET  /metrics` | 当前指标一致快照（全局汇总）；带 `?source=<名>` 时只看对应来源 |
+| `GET  /metrics/sources` | 各来源分别的快照 + 来源基数观测（上限、是否归并、归并量） |
 | `POST /alerts/evaluate` | 对当前规则集评估一轮（评估前先收敛），返回全部告警 |
-| `GET  /alerts` | 查看进行中告警与最近收敛历史 |
+| `GET  /alerts` | 查看进行中告警与最近收敛历史（含 `source` 维度） |
 | `POST /rules/reload` | 整批热更新规则，返回加载/拒绝数与逐条失败原因 |
 | `GET  /rules` | 查看当前规则版本与内容 |
 
-## 6. 本地运行
+## 8. 本地运行
 
 ```bash
 uv sync --group dev
@@ -150,7 +211,37 @@ curl -s -X POST localhost:8000/alerts/evaluate
 curl -s localhost:8000/alerts
 ```
 
-## 7. 测试与验证
+来源维度手工验证：
+
+```bash
+# 5) 按来源上报：web 出错、app 正常；不带来源的落入 default
+curl -s localhost:8000/metrics/report -H 'content-type: application/json' \
+  -d '{"request_id":"w1","duration_ms":12,"status_code":500,"error":"boom","source":"web"}'
+curl -s localhost:8000/metrics/report -H 'content-type: application/json' \
+  -d '{"request_id":"a1","duration_ms":8,"status_code":200,"source":"app"}'
+curl -s localhost:8000/metrics/report -H 'content-type: application/json' \
+  -d '{"request_id":"old1","duration_ms":5,"status_code":200}'
+
+# 6) 全局汇总与按来源分别查看（全局 = 各来源之和）
+curl -s localhost:8000/metrics
+curl -s 'localhost:8000/metrics?source=web'
+curl -s localhost:8000/metrics/sources   # 各来源快照 + 基数/归并观测
+
+# 7) 按来源判定的告警规则：web 触发、app 安静，告警上带 source 字段
+curl -s localhost:8000/rules/reload -H 'content-type: application/json' -d '{
+  "rules": [
+    {"name":"per-src-err","metric":"error_count","threshold":1,"window_seconds":60,"source":"*"}
+  ]
+}'
+# 若距第 5 步已超过 60s 窗口，先补一条新鲜的 web 错误再评估
+curl -s localhost:8000/metrics/report -H 'content-type: application/json' \
+  -d '{"request_id":"w2","duration_ms":12,"status_code":500,"error":"boom","source":"web"}'
+curl -s -X POST localhost:8000/alerts/evaluate
+# 期望看到 fingerprint 为 rule:per-src-err|source:web、source 为 web 的 firing 告警，
+# 而 app/default 来源没有告警
+```
+
+## 9. 测试与验证
 
 ```bash
 uv run pytest -q
@@ -162,10 +253,13 @@ uv run pytest -q
 | 测试文件 | 覆盖业务 |
 | --- | --- |
 | `tests/test_tracing_metrics.py` | 请求级指标与链路标识：唯一 id、上下文隔离、幂等、采样口径、并发同 id/不同 id/采样切换 |
+| `tests/test_source_metrics.py` | 来源维度指标与基数上限：默认来源、全局与来源对账、并发多来源隔离、超限归并与可观测 |
 | `tests/test_alert_engine.py` | 窗口告警判定与合并去重：触发/重复/升级/续期/收敛/新周期，并发下只一条告警、升级恰好一次 |
+| `tests/test_source_alerts.py` | 按来源告警判定：同一条规则多来源各自触发/去重/升级/收敛互不影响、老规则兼容、来源字段校验、并发混跑一致 |
 | `tests/test_rule_store.py` | 规则热更新与降级：逐条隔离、原因可区分、整批失败保留上一版、重名、并发热更新版本严格递增 |
 | `tests/test_evaluation.py` | 窗口聚合与编排：四种指标口径、窗口边界、无样本不触发、评估前自动收敛 |
 | `tests/test_api.py` | HTTP 端到端：链路响应头、上报幂等、接口级并发一致性、热更新接口、告警全生命周期 |
+| `tests/test_source_api.py` | 来源维度 HTTP 端到端：按来源上报/查询、来源总览与归并观测、按来源规则的告警生命周期 |
 
 并发场景通过多线程 + `Barrier` 同时触发来验证“同一临界区只有一个赢家、
 计数无丢失”；时间相关语义通过可注入时钟（`FakeClock`）做确定性验证，

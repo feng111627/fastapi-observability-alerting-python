@@ -12,14 +12,16 @@ from fastapi import FastAPI, Request
 from app import tracing
 from app.alerts import AlertEngine
 from app.evaluation import Evaluator
-from app.metrics import MetricsRegistry
+from app.metrics import MetricsRegistry, MetricSnapshot
 from app.rules import RuleStore
 from app.schemas import (
     AlertOut,
+    CardinalityOut,
     MetricReport,
     MetricSnapshotOut,
     RuleLoadResult,
     RuleReloadRequest,
+    SourcesOverviewOut,
 )
 
 logger = logging.getLogger("observability")
@@ -35,10 +37,27 @@ class MonotonicClock:
         return time.monotonic()
 
 
-def create_app(clock: MonotonicClock | None = None) -> FastAPI:
-    """应用工厂：组装注册表、告警引擎、规则存储、评估器与路由。"""
+def _snapshot_out(snap: MetricSnapshot) -> MetricSnapshotOut:
+    return MetricSnapshotOut(
+        total=snap.total,
+        sampled=snap.sampled,
+        error_count=snap.error_count,
+        sum_duration_ms=snap.sum_duration_ms,
+        avg_duration_ms=snap.avg_duration_ms,
+        error_rate=snap.error_rate,
+        by_status=snap.by_status,
+        source=snap.source,
+    )
+
+
+def create_app(clock: MonotonicClock | None = None, max_sources: int = 128) -> FastAPI:
+    """应用工厂：组装注册表、告警引擎、规则存储、评估器与路由。
+
+    ``max_sources`` 为来源基数上限：超出后新来源归并到溢出桶，
+    可通过 ``GET /metrics/sources`` 观察归并情况。
+    """
     clock = clock or MonotonicClock()
-    registry = MetricsRegistry()
+    registry = MetricsRegistry(max_sources=max_sources)
     engine = AlertEngine()
     store = RuleStore()
     evaluator = Evaluator(registry, engine, store, clock=clock.time)
@@ -108,7 +127,11 @@ def create_app(clock: MonotonicClock | None = None) -> FastAPI:
 
     @app.post("/metrics/report", tags=["metrics"])
     def report_metric(body: MetricReport):
-        """幂等上报一次请求指标；同一 request_id 重复上报不重复计数。"""
+        """幂等上报一次请求指标；同一 request_id 重复上报不重复计数。
+
+        source 缺省/空白时落入默认来源；来源总数超过上限后，
+        新来源归并到溢出桶（见 GET /metrics/sources）。
+        """
         request_id = body.request_id or tracing.current_request_id() or tracing.new_request_id()
         trace_id = body.trace_id or tracing.current_trace_id() or tracing.new_trace_id()
         accepted = registry.record(
@@ -119,6 +142,7 @@ def create_app(clock: MonotonicClock | None = None) -> FastAPI:
             error=body.error,
             sampled=body.sampled,
             now=clock.time(),
+            source=body.source,
         )
         return {
             "request_id": request_id,
@@ -128,19 +152,36 @@ def create_app(clock: MonotonicClock | None = None) -> FastAPI:
         }
 
     @app.get("/metrics", response_model=MetricSnapshotOut, tags=["metrics"])
-    def get_metrics():
-        return registry.snapshot()
+    def get_metrics(source: str | None = None):
+        """指标一致快照；默认全局汇总，带 ``?source=`` 时只看对应来源。"""
+        return _snapshot_out(registry.snapshot(source=source))
+
+    @app.get("/metrics/sources", response_model=SourcesOverviewOut, tags=["metrics"])
+    def get_metrics_by_source():
+        """各来源分别的快照 + 来源基数观测（上限/归并情况）。"""
+        card = registry.cardinality()
+        return SourcesOverviewOut(
+            cardinality=CardinalityOut(
+                max_sources=card.max_sources,
+                active_sources=card.active_sources,
+                overflowed=card.overflowed,
+                overflow_records=card.overflow_records,
+                overflow_sources_sample=sorted(card.overflow_sources_sample),
+            ),
+            sources=[_snapshot_out(registry.snapshot(source=s)) for s in registry.sources()],
+        )
 
     @app.post("/alerts/evaluate", response_model=list[AlertOut], tags=["alerts"])
     def evaluate_alerts():
         """对当前规则集评估一轮，返回当前全部告警（含本次变化）。"""
         changes = evaluator.evaluate_once()
-        for rule, kind, value in changes:
+        for rule, kind, value, source in changes:
             if kind in ("triggered", "upgraded"):
                 logger.warning(
-                    "告警%s rule=%s metric=%s value=%.4f kind=%s",
+                    "告警%s rule=%s source=%s metric=%s value=%.4f kind=%s",
                     "升级" if kind == "upgraded" else "触发",
                     rule.name,
+                    source or "<global>",
                     rule.metric,
                     value,
                     kind,
@@ -177,6 +218,7 @@ def create_app(clock: MonotonicClock | None = None) -> FastAPI:
                     "window_seconds": r.window_seconds,
                     "severity": r.severity,
                     "upgrade_after": r.upgrade_after,
+                    "source": r.source,
                 }
                 for r in current.rules
             ],
