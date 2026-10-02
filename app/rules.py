@@ -17,7 +17,12 @@ VALID_SEVERITIES = frozenset({"warning", "critical"})
 
 @dataclass(frozen=True)
 class AlertRule:
-    """一条经过校验的不可变告警规则。"""
+    """一条经过校验的不可变告警规则。
+
+    by_source=False（缺省，兼容老规则集）：按全局口径评估，一条规则
+    一条告警流；by_source=True：按来源分别评估，每个来源独立的
+    告警周期（触发/合并/升级/收敛互不影响）。
+    """
 
     name: str
     metric: str
@@ -25,6 +30,7 @@ class AlertRule:
     window_seconds: float
     severity: str = "warning"
     upgrade_after: int = 0
+    by_source: bool = False
 
 
 class RuleValidationError(ValueError):
@@ -120,6 +126,13 @@ def validate_rule(raw: dict) -> AlertRule:
             f"规则[{name}] upgrade_after: 不能为负数，收到 {upgrade_after}"
         )
 
+    # 老规则集不带该字段，缺省 False（全局口径），加载不得失败。
+    by_source = raw.get("by_source", False)
+    if not isinstance(by_source, bool):
+        raise RuleValidationError(
+            f"规则[{name}] by_source: 必须是布尔值，收到 {by_source!r}"
+        )
+
     return AlertRule(
         name=name,
         metric=metric,
@@ -127,6 +140,7 @@ def validate_rule(raw: dict) -> AlertRule:
         window_seconds=window,
         severity=severity,
         upgrade_after=upgrade_after,
+        by_source=by_source,
     )
 
 
