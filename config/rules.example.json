@@ -8,12 +8,13 @@
     "upgrade_after": 3
   },
   {
-    "name": "error_count_1m_burst",
+    "name": "error_count_1m_burst_by_source",
     "metric": "error_count",
     "threshold": 10,
     "window_seconds": 60,
     "severity": "warning",
-    "upgrade_after": 5
+    "upgrade_after": 5,
+    "by_source": true
   },
   {
     "name": "latency_p95_5m_slow",
