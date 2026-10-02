@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request
 from app import tracing
 from app.alerts import AlertEngine
 from app.evaluation import Evaluator
-from app.metrics import MetricsRegistry
+from app.metrics import DEFAULT_MAX_SOURCES, MetricsRegistry
 from app.rules import RuleStore
 from app.schemas import (
     AlertOut,
@@ -20,6 +20,8 @@ from app.schemas import (
     MetricSnapshotOut,
     RuleLoadResult,
     RuleReloadRequest,
+    SourceMetricsOut,
+    SourceStatsOut,
 )
 
 logger = logging.getLogger("observability")
@@ -35,10 +37,14 @@ class MonotonicClock:
         return time.monotonic()
 
 
-def create_app(clock: MonotonicClock | None = None) -> FastAPI:
-    """应用工厂：组装注册表、告警引擎、规则存储、评估器与路由。"""
+def create_app(clock: MonotonicClock | None = None, max_sources: int = DEFAULT_MAX_SOURCES) -> FastAPI:
+    """应用工厂：组装注册表、告警引擎、规则存储、评估器与路由。
+
+    max_sources：生效来源数量上限，超出后新来源归并到 __overflow__
+    保留桶（见 GET /metrics/sources 的 stats 口径）。
+    """
     clock = clock or MonotonicClock()
-    registry = MetricsRegistry()
+    registry = MetricsRegistry(max_sources=max_sources)
     engine = AlertEngine()
     store = RuleStore()
     evaluator = Evaluator(registry, engine, store, clock=clock.time)
@@ -79,6 +85,7 @@ def create_app(clock: MonotonicClock | None = None) -> FastAPI:
     async def observability_middleware(request: Request, call_next):
         request_id = request.headers.get("x-request-id") or tracing.new_request_id()
         trace_id = request.headers.get("x-trace-id") or tracing.new_trace_id()
+        source = request.headers.get("x-source")  # 未带时落入默认来源
         tokens = tracing.set_context(request_id, trace_id)
         start = clock.time()
         response = None
@@ -100,6 +107,7 @@ def create_app(clock: MonotonicClock | None = None) -> FastAPI:
                 error=error,
                 sampled=True,
                 now=clock.time(),
+                source=source,
             )
             if response is not None:
                 response.headers["x-request-id"] = request_id
@@ -108,7 +116,11 @@ def create_app(clock: MonotonicClock | None = None) -> FastAPI:
 
     @app.post("/metrics/report", tags=["metrics"])
     def report_metric(body: MetricReport):
-        """幂等上报一次请求指标；同一 request_id 重复上报不重复计数。"""
+        """幂等上报一次请求指标；同一 request_id 重复上报不重复计数。
+
+        source 未携带时落入默认来源 default；来源数量超限后归并到
+        __overflow__ 保留桶，响应中的 source 为实际生效来源。
+        """
         request_id = body.request_id or tracing.current_request_id() or tracing.new_request_id()
         trace_id = body.trace_id or tracing.current_trace_id() or tracing.new_trace_id()
         accepted = registry.record(
@@ -119,17 +131,49 @@ def create_app(clock: MonotonicClock | None = None) -> FastAPI:
             error=body.error,
             sampled=body.sampled,
             now=clock.time(),
+            source=body.source,
         )
         return {
             "request_id": request_id,
             "trace_id": trace_id,
+            "source": registry.get(request_id).source,
             "accepted": accepted,
             "duplicate": not accepted,
         }
 
     @app.get("/metrics", response_model=MetricSnapshotOut, tags=["metrics"])
     def get_metrics():
+        """全局一致快照（= 各生效来源快照之和）。"""
         return registry.snapshot()
+
+    @app.get("/metrics/sources", response_model=SourceMetricsOut, tags=["metrics"])
+    def get_metrics_by_source():
+        """按来源的一致快照 + 来源上限/溢出归并的可观察口径。"""
+        stats = registry.source_stats()
+        return SourceMetricsOut(
+            stats=SourceStatsOut(
+                max_sources=stats.max_sources,
+                source_count=stats.source_count,
+                sources=list(stats.sources),
+                overflow_source=stats.overflow_source,
+                overflowed=stats.overflowed,
+                overflow_records=stats.overflow_records,
+                overflow_sources_seen=stats.overflow_sources_seen,
+                overflow_samples_truncated=stats.overflow_samples_truncated,
+            ),
+            by_source={
+                src: MetricSnapshotOut(
+                    total=snap.total,
+                    sampled=snap.sampled,
+                    error_count=snap.error_count,
+                    sum_duration_ms=snap.sum_duration_ms,
+                    avg_duration_ms=snap.avg_duration_ms,
+                    error_rate=snap.error_rate,
+                    by_status=snap.by_status,
+                )
+                for src, snap in registry.snapshot_all_sources().items()
+            },
+        )
 
     @app.post("/alerts/evaluate", response_model=list[AlertOut], tags=["alerts"])
     def evaluate_alerts():
@@ -178,6 +222,7 @@ def create_app(clock: MonotonicClock | None = None) -> FastAPI:
                     "window_seconds": r.window_seconds,
                     "severity": r.severity,
                     "upgrade_after": r.upgrade_after,
+                    "by_source": r.by_source,
                 }
                 for r in current.rules
             ],
