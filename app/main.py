@@ -135,12 +135,13 @@ def create_app(clock: MonotonicClock | None = None) -> FastAPI:
     def evaluate_alerts():
         """对当前规则集评估一轮，返回当前全部告警（含本次变化）。"""
         changes = evaluator.evaluate_once()
-        for rule, kind, value in changes:
+        for rule, kind, value, source in changes:
             if kind in ("triggered", "upgraded"):
                 logger.warning(
-                    "告警%s rule=%s metric=%s value=%.4f kind=%s",
+                    "告警%s rule=%s source=%s metric=%s value=%.4f kind=%s",
                     "升级" if kind == "upgraded" else "触发",
                     rule.name,
+                    source or "<global>",
                     rule.metric,
                     value,
                     kind,

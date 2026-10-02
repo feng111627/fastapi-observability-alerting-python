@@ -45,7 +45,7 @@ def test_error_rate窗口聚合与触发(harness):
     registry.record("old", "tr", 10, 500, error="x", now=939.9)  # 窗口外
 
     results = evaluator.evaluate_once()
-    _r, kind, value = results[0]
+    _r, kind, value, _src = results[0]
     assert kind == "triggered"
     assert value == pytest.approx(2 / 3)  # 旧样本不计入
 
@@ -112,7 +112,7 @@ def test_规则热更新后按新版评估_单条坏规则不影响(harness):
     assert report.loaded == 1 and report.rejected == 1
     results = evaluator.evaluate_once()
     assert len(results) == 1
-    _r, kind, _v = results[0]
+    _r, kind, _v, _src = results[0]
     assert kind == "triggered" and _r.name == "v2"
 
 
