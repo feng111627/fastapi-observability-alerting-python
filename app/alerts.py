@@ -1,8 +1,9 @@
 """基于时间窗口的告警引擎。
 
 职责与语义（详见 docs/observability.md）：
-- 以规则名为 fingerprint，同一规则同一时间只保留一条进行中的有效告警，
-  窗口内重复触发合并计数，不会重复告警；
+- 以规则名（by_source 规则再加上来源）为 fingerprint，同一规则同一来源
+  同一时间只保留一条进行中的有效告警，窗口内重复触发合并计数，不会重复告警；
+  不同来源的告警流完全独立：各自触发、合并、升级、收敛，互不影响；
 - 首次越阈 -> ``triggered``（warning 或规则声明的初始级别）；
   持续触发达到 ``upgrade_after`` 次后升级为 critical -> ``upgraded``，
   之后的命中只合并计数 -> ``repeated``；
@@ -32,7 +33,11 @@ _FIRING = "firing"
 
 @dataclass
 class AlertState:
-    """一条进行中/已收敛的告警状态。"""
+    """一条进行中/已收敛的告警状态。
+
+    source 为 None 表示全局口径告警（老规则）；by_source 规则下
+    每个来源一条独立告警流，source 记录该流归属的来源。
+    """
 
     fingerprint: str
     rule: str
@@ -42,6 +47,7 @@ class AlertState:
     first_seen: float
     last_seen: float
     window_seconds: float
+    source: str | None = None
     resolved_at: float | None = None
 
 
@@ -54,10 +60,12 @@ class AlertEngine:
         self._history: dict[str, list[AlertState]] = {}
 
     @staticmethod
-    def fingerprint(rule_name: str) -> str:
-        # 当前一个规则即一条异常流；保留 fingerprint 抽象，
-        # 便于将来在 key 中加入维度（如来源、环境）而不改调用方。
-        return f"rule:{rule_name}"
+    def fingerprint(rule_name: str, source: str | None = None) -> str:
+        # 全局规则：rule:<name>（与老版本完全一致）；
+        # by_source 规则：rule:<name>|source:<source>，每个来源一条独立告警流。
+        if source is None:
+            return f"rule:{rule_name}"
+        return f"rule:{rule_name}|source:{source}"
 
     def evaluate(
         self,
@@ -65,8 +73,9 @@ class AlertEngine:
         value: float,
         firing: bool,
         now: float,
+        source: str | None = None,
     ) -> str:
-        """评估单条规则的一次观测。
+        """评估单条规则的一次观测（source 非空时按来源独立判定）。
 
         返回状态变化类型：
         - ``triggered``：新建一条有效告警；
@@ -74,7 +83,7 @@ class AlertEngine:
         - ``upgraded``：持续命中达到升级次数，已升为 critical；
         - ``none``：未越阈，不产生变化（收敛由 :meth:`sweep` 负责）。
         """
-        fp = self.fingerprint(rule.name)
+        fp = self.fingerprint(rule.name, source)
         with self._lock:
             if not firing:
                 # 单次未越阈不立即收敛：异常是否结束以时间窗口为准，
@@ -92,6 +101,7 @@ class AlertEngine:
                     first_seen=now,
                     last_seen=now,
                     window_seconds=rule.window_seconds,
+                    source=source,
                 )
                 self._active[fp] = state
                 return _TRIGGERED
